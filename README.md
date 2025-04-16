@@ -9,7 +9,7 @@
 <span style="color: #FF5733; font-weight: bold">For more features and to experience the full capabilities of our product, please visit [https://vivago.ai/](https://vivago.ai/).</span>
 
 ## Project Updates
-- **April 11, 2025**: HiDream is now officially supported in the `diffusers` library. Check out the docs [here](https://huggingface.co/docs/diffusers/main/en/api/pipelines/hidream).
+- 🤗 **April 11, 2025**: HiDream is now officially supported in the `diffusers` library. Check out the docs [here](https://huggingface.co/docs/diffusers/main/en/api/pipelines/hidream).
 - 🤗 **April 8, 2025**: We've launched a Hugging Face Space for **HiDream-I1-Dev**. Experience our model firsthand at [https://huggingface.co/spaces/HiDream-ai/HiDream-I1-Dev](https://huggingface.co/spaces/HiDream-ai/HiDream-I1-Dev)!
 - 🚀 **April 7, 2025**: We've open-sourced the text-to-image model **HiDream-I1**. 
 
@@ -57,7 +57,47 @@ We also provide a Gradio demo for interactive image generation. You can run the 
 python gradio_demo.py 
 ```
 
+## Inference with Diffusers
 
+We recommend install Diffusers from source for better compatibility.
+
+```shell
+pip install git+https://github.com/huggingface/diffusers.git
+```
+
+Then you can inference **HiDream-I1** with the following command:
+
+```python
+import torch
+from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
+from diffusers import HiDreamImagePipeline
+tokenizer_4 = PreTrainedTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct")
+text_encoder_4 = LlamaForCausalLM.from_pretrained(
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    output_hidden_states=True,
+    output_attentions=True,
+    torch_dtype=torch.bfloat16,
+)
+
+pipe = HiDreamImagePipeline.from_pretrained(
+    "HiDream-ai/HiDream-I1-Full",  # "HiDream-ai/HiDream-I1-Dev" | "HiDream-ai/HiDream-I1-Fast"
+    tokenizer_4=tokenizer_4,
+    text_encoder_4=text_encoder_4,
+    torch_dtype=torch.bfloat16,
+)
+
+pipe = pipe.to('cuda')
+
+image = pipe(
+    'A cat holding a sign that says "HiDream.ai".',
+    height=1024,
+    width=1024,
+    guidance_scale=5.0,  # 0.0 for Dev&Fast
+    num_inference_steps=50,  # 28 for Dev and 16 for Fast
+    generator=torch.Generator("cuda").manual_seed(0),
+).images[0]
+image.save("output.png")
+```
 
 ## Evaluation Metrics
 
