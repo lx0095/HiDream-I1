@@ -1,4 +1,8 @@
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+torch_npu.npu.config.allow_internal_format = False
+torch_npu.npu.set_compile_mode(jit_compile=False)
 import argparse
 from hi_diffusers import HiDreamImagePipeline
 from hi_diffusers import HiDreamImageTransformer2DModel
@@ -77,6 +81,7 @@ def load_models(model_type):
         torch_dtype=torch.bfloat16
     ).to("cuda", torch.bfloat16)
     pipe.transformer = transformer
+    pipe.enable_sequential_cpu_offload()
     
     return pipe, config
 
