@@ -1,40 +1,10 @@
 import math
 import torch
+import torch_npu
 from torch import nn
 import torch.nn.functional as F
 from .attention import FeedForwardSwiGLU
 from torch.distributed.nn.functional import all_gather
-from typing import Optional
-
-def broadcast(src: torch.Tensor, other: torch.Tensor, dim: int):
-    if dim < 0:
-        dim = other.dim() + dim
-    if src.dim() == 1:
-        for _ in range(0, dim):
-            src = src.unsqueeze(0)
-    for _ in range(src.dim(), other.dim()):
-        src = src.unsqueeze(-1)
-    src = src.expand(other.size())
-    return src
-
-def scatter_sum(src: torch.Tensor,
-                index: torch.Tensor,
-                dim: int = -1,
-                out: Optional[torch.Tensor] = None,
-                dim_size: Optional[int] = None) -> torch.Tensor:
-    index = broadcast(index, src, dim)
-    if out is None:
-        size = list(src.size())
-        if dim_size is not None:
-            size[dim] = dim_size
-        elif index.numel() == 0:
-            size[dim] = 0
-        else:
-            size[dim] = int(index.max()) + 1
-        out = torch.zeros(size, dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index, src)
-    else:
-        return out.scatter_add_(dim, index, src)
 
 _LOAD_BALANCING_LOSS = []
 def save_load_balancing_loss(loss):
@@ -88,14 +58,13 @@ class MoEGate(nn.Module):
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
-        if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
-        else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         
         ### select top-k experts
-        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        
+        if self.scoring_func == 'softmax':
+            topk_weight, topk_idx, row_idx = torch_npu.npu_moe_gating_top_k_softmax(logits, k=self.top_k)
+        else:
+            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+
         ### norm gate to sum 1
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
@@ -103,7 +72,7 @@ class MoEGate(nn.Module):
 
         ### expert-level computation auxiliary loss
         if self.training and self.alpha > 0.0:
-            scores_for_aux = scores
+            scores_for_aux = logits.softmax(dim=-1)
             aux_topk = self.top_k
             # always compute aux loss based on the naive greedy topk method
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
@@ -122,7 +91,7 @@ class MoEGate(nn.Module):
                 save_load_balancing_loss((aux_loss, Pi, fi, self.alpha))
         else:
             aux_loss = None
-        return topk_idx, topk_weight, aux_loss
+        return topk_idx, topk_weight, row_idx, aux_loss
 
 # Modified from https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 class MOEFeedForwardSwiGLU(nn.Module):
@@ -142,15 +111,16 @@ class MOEFeedForwardSwiGLU(nn.Module):
             num_activated_experts = num_activated_experts
         )
         self.num_activated_experts = num_activated_experts
+        self.num_routed_experts = num_routed_experts
 
     def forward(self, x):
         wtype = x.dtype
         identity = x
         orig_shape = x.shape
-        topk_idx, topk_weight, aux_loss = self.gate(x) 
+        topk_idx, topk_weight, row_idx, aux_loss = self.gate(x)
         x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            flat_topk_idx = topk_idx.view(-1)
             x = x.repeat_interleave(self.num_activated_experts, dim=0)
             y = torch.empty_like(x, dtype=wtype)
             for i, expert in enumerate(self.experts): 
@@ -159,27 +129,55 @@ class MOEFeedForwardSwiGLU(nn.Module):
             y =  y.view(*orig_shape).to(dtype=wtype)
             #y = AddAuxiliaryLoss.apply(y, aux_loss)
         else:
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+            y = self.moe_infer(x, topk_idx, topk_weight.view(-1, 1), row_idx).view(*orig_shape)
         y = y + self.shared_experts(identity)
         return y
-    
+
     @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        expert_cache = torch.zeros_like(x) 
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.num_activated_experts 
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i-1]
-            if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]]) 
-            
-            # for fp16 and other dtype
-            expert_cache = expert_cache.to(expert_out.dtype)
-            expert_cache = scatter_sum(expert_out, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), 0, out=expert_cache)
-        return expert_cache
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights, row_idx):
+        expanded_x, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(x, row_idx, flat_expert_indices, active_num=x.shape[0])
+        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, self.num_routed_experts)
+        # expert_tokens = expert_tokens.to(torch.int64)
+        expert_tokens = expert_tokens.cpu().numpy()
+        up_out = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[expert_i.w1.weight.transpose(0, 1) for expert_i in self.experts],
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+        gate_out = torch_npu.npu_grouped_matmul(
+            x=[expanded_x],
+            weight=[expert_i.w3.weight.transpose(0, 1) for expert_i in self.experts],
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+
+        up_out = torch.cat(up_out, dim=0)
+        gate_out = torch.cat(gate_out, dim=0)
+        gate_up_out = F.silu(up_out) * gate_out
+        # maybe has accuracy problem
+        # gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+        down_out = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[expert_i.w2.weight.transpose(0, 1) for expert_i in self.experts],
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+        # TODO: Reorder device memory 2 times here, replace the current
+        # implementation here when suitable operators become available.
+        down_out = torch.cat(down_out, dim=0)
+        final_hidden_states = torch_npu.npu_moe_finalize_routing(
+            down_out,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=flat_expert_weights.view(-1, 2),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=flat_expert_indices,
+        )
+        #breakpoint()
+        return final_hidden_states

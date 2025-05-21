@@ -22,6 +22,15 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> t
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
+import torch_npu
+def apply_rope_npu(xq, xk, freqs_cis, interleaved=True):
+    cos, sin = freqs_cis[0, ..., 0, 0], freqs_cis[0, ..., 1, 0]
+    cos = einops.repeat(cos, '... d -> ... (d 2)').unsqueeze(0)
+    sin = einops.repeat(sin, '... d -> ... (d 2)').unsqueeze(0)
+    xq_out = torch_npu.npu_rotary_mul(xq.float(), cos.contiguous(), sin.contiguous(), "interleave" if interleaved else "half")
+    xk_out = torch_npu.npu_rotary_mul(xk.float(), cos.contiguous(), sin.contiguous(), "interleave" if interleaved else "half")
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
 def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
     if ATTN_FUNC_BACKEND == "FLASH_ATTN_3":
         hidden_states = flash_attn_func(query, key, value, causal=False, deterministic=False)[0]
@@ -90,7 +99,8 @@ class HiDreamAttnProcessor_flashattn:
             value = value_i
         
         if query.shape[-1] == rope.shape[-3] * 2:
-            query, key = apply_rope(query, key, rope)
+            # query, key = apply_rope(query, key, rope)
+            query, key = apply_rope_npu(query, key, rope)
         else:
             query_1, query_2 = query.chunk(2, dim=-1)
             key_1, key_2 = key.chunk(2, dim=-1)
