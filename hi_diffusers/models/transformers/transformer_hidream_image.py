@@ -26,7 +26,7 @@ class TextProjection(nn.Module):
     def forward(self, caption):
         hidden_states = self.linear(caption)
         return hidden_states
-    
+
 class BlockType:
     TransformerBlock = 1
     SingleTransformerBlock = 2
@@ -335,31 +335,25 @@ class HiDreamImageTransformer2DModel(
                 )
             x = torch.cat(x_arr, dim=0)
         return x
+    
+    def patchify(self, x, max_seq, img_sizes):
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+        patch_size = self.config.patch_size
+        pH, pW = H // patch_size, W // patch_size
 
-    def patchify(self, x, max_seq, img_sizes=None):
-        pz2 = self.config.patch_size * self.config.patch_size
-        if isinstance(x, torch.Tensor):
-            B, C = x.shape[0], x.shape[1]
-            device = x.device
-            dtype = x.dtype
-        else:
-            B, C = len(x), x[0].shape[0]
-            device = x[0].device
-            dtype = x[0].dtype
-        x_masks = torch.zeros((B, max_seq), dtype=dtype, device=device)
-
-        if img_sizes is not None:
+        x_masks = None
+        x = einops.rearrange(x, 'B C (H p1) (W p2) -> B (H W) (p1 p2 C)', p1=patch_size, p2=patch_size)
+        if H != W:
+            x_masks = torch.zeros((B, max_seq), dtype=dtype, device=device)
             for i, img_size in enumerate(img_sizes):
                 x_masks[i, 0:img_size[0] * img_size[1]] = 1
-            x = einops.rearrange(x, 'B C S p -> B S (p C)', p=pz2)
-        elif isinstance(x, torch.Tensor):
-            pH, pW = x.shape[-2] // self.config.patch_size, x.shape[-1] // self.config.patch_size
-            x = einops.rearrange(x, 'B C (H p1) (W p2) -> B (H W) (p1 p2 C)', p1=self.config.patch_size, p2=self.config.patch_size)
-            img_sizes = [[pH, pW]] * B
-            x_masks = None
-        else:
-            raise NotImplementedError
-        return x, x_masks, img_sizes
+            out = torch.zeros((B, max_seq, patch_size * patch_size * C), dtype=dtype, device=device)
+            out[:, 0:pH*pW] = x
+            x = out
+
+        return x, x_masks
 
     def forward(
         self,
@@ -368,7 +362,7 @@ class HiDreamImageTransformer2DModel(
         encoder_hidden_states: torch.Tensor = None,
         pooled_embeds: torch.Tensor = None,
         img_sizes: Optional[List[Tuple[int, int]]] = None,
-        img_ids: Optional[torch.Tensor] = None,
+        rope: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ):
@@ -397,13 +391,7 @@ class HiDreamImageTransformer2DModel(
         p_embedder = self.p_embedder(pooled_embeds)
         adaln_input = timesteps + p_embedder
 
-        hidden_states, image_tokens_masks, img_sizes = self.patchify(hidden_states, self.max_seq, img_sizes)
-        if image_tokens_masks is None:
-            pH, pW = img_sizes[0]
-            img_ids = torch.zeros(pH, pW, 3, device=hidden_states.device)
-            img_ids[..., 1] = img_ids[..., 1] + torch.arange(pH, device=hidden_states.device)[:, None]
-            img_ids[..., 2] = img_ids[..., 2] + torch.arange(pW, device=hidden_states.device)[None, :]
-            img_ids = repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
+        hidden_states, image_tokens_masks = self.patchify(hidden_states, self.max_seq, img_sizes)
         hidden_states = self.x_embedder(hidden_states)
 
         T5_encoder_hidden_states = encoder_hidden_states[0]
@@ -421,15 +409,6 @@ class HiDreamImageTransformer2DModel(
             T5_encoder_hidden_states = T5_encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
             encoder_hidden_states.append(T5_encoder_hidden_states)
 
-        txt_ids = torch.zeros(
-            batch_size, 
-            encoder_hidden_states[-1].shape[1] + encoder_hidden_states[-2].shape[1] + encoder_hidden_states[0].shape[1], 
-            3, 
-            device=img_ids.device, dtype=img_ids.dtype
-        )
-        ids = torch.cat((img_ids, txt_ids), dim=1)
-        rope = self.pe_embedder(ids)
-
         # 2. Blocks
         block_id = 0
         initial_encoder_hidden_states = torch.cat([encoder_hidden_states[-1], encoder_hidden_states[-2]], dim=1)
@@ -445,7 +424,7 @@ class HiDreamImageTransformer2DModel(
                         else:
                             return module(*inputs)
                     return custom_forward
-                
+
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
                 hidden_states, initial_encoder_hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),

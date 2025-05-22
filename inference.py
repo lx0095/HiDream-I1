@@ -1,173 +1,334 @@
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import logging
+import time
 import os
+import csv
+import json
+
 import torch
 import torch_npu
-from torch_npu.contrib import transfer_to_npu
-torch_npu.npu.config.allow_internal_format = False
-torch_npu.npu.set_compile_mode(jit_compile=False)
-import argparse
+
 from hi_diffusers import HiDreamImagePipeline
 from hi_diffusers import HiDreamImageTransformer2DModel
+from hi_diffusers.utils import PromptLoader, parse_resolution
 from hi_diffusers.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from hi_diffusers.schedulers.flash_flow_match import FlashFlowMatchEulerDiscreteScheduler
 from transformers import LlamaForCausalLM, PreTrainedTokenizerFast
-import os
 
-MODEL_PREFIX = "./HiDream-ai"
-# LLAMA_MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-LLAMA_MODEL_NAME = "./Meta-Llama-3.1-8B-Instruct"
-# Model configurations
-MODEL_CONFIGS = {
-    "dev": {
-        "path": f"{MODEL_PREFIX}/HiDream-I1-Dev",
-        "guidance_scale": 0.0,
-        "num_inference_steps": 28,
-        "shift": 6.0,
-        "scheduler": FlashFlowMatchEulerDiscreteScheduler
-    },
-    "full": {
-        "path": f"{MODEL_PREFIX}/HiDream-I1-Full",
-        "guidance_scale": 5.0,
-        "num_inference_steps": 50,
-        "shift": 3.0,
-        "scheduler": FlowUniPCMultistepScheduler
-    },
-    "fast": {
-        "path": f"{MODEL_PREFIX}/HiDream-I1-Fast",
-        "guidance_scale": 0.0,
-        "num_inference_steps": 16,
-        "shift": 3.0,
-        "scheduler": FlashFlowMatchEulerDiscreteScheduler
-    }
-}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Resolution options
-RESOLUTION_OPTIONS = [
-    "1024 × 1024 (Square)",
-    "768 × 1360 (Portrait)",
-    "1360 × 768 (Landscape)",
-    "880 × 1168 (Portrait)",
-    "1168 × 880 (Landscape)",
-    "1248 × 832 (Landscape)",
-    "832 × 1248 (Portrait)"
-]
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Generate an image using the HiDream-I1 model.")
 
-# Load models
-def load_models(model_type):
-    config = MODEL_CONFIGS[model_type]
-    pretrained_model_name_or_path = config["path"]
-    scheduler = MODEL_CONFIGS[model_type]["scheduler"](num_train_timesteps=1000, shift=config["shift"], use_dynamic_shifting=False)
-    
-    
-    # Load tokenizer (doesn't need to be on GPU)
+    # Define arguments for prompt, model path, etc.
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default="./prompts/example_prompts.txt",
+        help="A text file of prompts for generating images.",
+    )
+    parser.add_argument(
+        "--prompt_file_type",
+        choices=["plain", "parti", "hpsv2"],
+        default="plain",
+        help="Type of prompt file.",
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./results",
+        help="Path to save result images.",
+    )
+    parser.add_argument(
+        "--info_file_save_path",
+        type=str,
+        default="./image_info.json",
+        help="Path to save image information file.",
+    )
+    parser.add_argument(
+        "--save_dir_prof",
+        type=str,
+        default="../prof",
+        help="Path to save profiling.",
+    )
+    parser.add_argument(
+        "--model_path", 
+        type=str, 
+        default="/mnt/mindie_data/sd_weights/HiDream-I1-Full", 
+        help="Path to the pre-trained HiDream-I1 model.",
+    )
+    parser.add_argument(
+        "--model_path_extra", 
+        type=str, 
+        default="/mnt/mindie_data/sd_weights/Llama-3.1-8B-Instruct", 
+        help="Path to the pre-trained Llama3.1 model.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size."
+    )
+    parser.add_argument(
+        "--num_images_per_prompt", 
+        type=int, 
+        default=1, 
+        help="Number of images to generate per prompt.",
+    )
+    parser.add_argument(
+        "--num_inference_steps", 
+        type=int, 
+        default=50, 
+        help="Number of denoising steps for inference."
+    )
+    parser.add_argument(
+        "--guidance_scale", 
+        type=float, 
+        default=5.0, 
+        help="The guidance scale for classifier-free guidance.",
+    )
+    parser.add_argument(
+        "--max_num_prompts",
+        default=0,
+        type=int,
+        help="Limit the number of prompts (0: no limit).",
+    )
+    parser.add_argument(
+        "--resolution", 
+        type=str, 
+        default="1024 x 1024", 
+        help="Resolution of the generated image."
+    )
+    parser.add_argument(
+        "--shift", 
+        type=float, 
+        default=3.0, 
+        help="Shift of scheduler."
+    )
+    parser.add_argument(
+        "--dtype", 
+        type=str, 
+        default="bf16", 
+        help="data type"
+    )
+    parser.add_argument(
+        "--seed", 
+        type=int, 
+        default=None, 
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--device_id", 
+        type=int, 
+        default=0, 
+        help="NPU device id"
+    )
+    parser.add_argument(
+        "--infer_type", 
+        type=str, 
+        default="Default", 
+        help="Default, Profiling or Accuracy."
+    )
+
+    return parser.parse_args()
+
+def load_pipe(args):
+    torch.npu.set_device(args.device_id)
+    device = f"npu:{args.device_id}"
+    if args.dtype == "bf16":
+        dtype = torch.bfloat16
+    else:
+        raise ValueError(f"Only support bf16. Don't support {args.dtype}.")
+
+    scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=1000, 
+        shift=args.shift, 
+        use_dynamic_shifting=False
+    )
+
     tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(
-        LLAMA_MODEL_NAME,
-        use_fast=False)
-    
-    # Use device_map to distribute text encoder across multiple GPUs
+        args.model_path_extra,
+        use_fast=False,
+        local_files_only=True
+    )
+
     text_encoder_4 = LlamaForCausalLM.from_pretrained(
-        LLAMA_MODEL_NAME,
+        args.model_path_extra,
         output_hidden_states=True,
-        output_attentions=False,
-        torch_dtype=torch.bfloat16).to('cuda')
+        output_attentions=True,
+        torch_dtype=dtype,
+        local_files_only=True
+    ).to(device)
 
-    # Use device_map to distribute transformer model across multiple GPUs
     transformer = HiDreamImageTransformer2DModel.from_pretrained(
-        pretrained_model_name_or_path, 
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16).to('cuda')
+        args.model_path, 
+        subfolder="transformer", 
+        torch_dtype=dtype
+    ).to(device)
 
-    # Load pipeline and configure device_map
     pipe = HiDreamImagePipeline.from_pretrained(
-        pretrained_model_name_or_path, 
+        args.model_path, 
         scheduler=scheduler,
         tokenizer_4=tokenizer_4,
         text_encoder_4=text_encoder_4,
-        torch_dtype=torch.bfloat16
-    ).to('cuda', torch.bfloat16)
+        torch_dtype=dtype
+    ).to(device, dtype)
     pipe.transformer = transformer
+    pipe.enable_model_cpu_offload(device=device)
 
-    from diffusers.hooks import apply_group_offloading
-    onload_device = torch.device("cuda")
-    apply_group_offloading(pipe.text_encoder_4, 
-                           onload_device=onload_device,
-                           offload_type="leaf_level",
-                           num_blocks_per_group=2,
-                           non_blocking=True,
-                           )
+    seed = args.seed if args.seed else torch.randint(0, 1000000, (1,)).item()
+    generator = torch.Generator(device).manual_seed(seed)
 
-    
-    return pipe, config
+    return pipe, generator
 
-# Parse resolution string to get height and width
-def parse_resolution(resolution_str):
-    if "1024 × 1024" in resolution_str:
-        return 1024, 1024
-    elif "768 × 1360" in resolution_str:
-        return 768, 1360
-    elif "1360 × 768" in resolution_str:
-        return 1360, 768
-    elif "880 × 1168" in resolution_str:
-        return 880, 1168
-    elif "1168 × 880" in resolution_str:
-        return 1168, 880
-    elif "1248 × 832" in resolution_str:
-        return 1248, 832
-    elif "832 × 1248" in resolution_str:
-        return 832, 1248
-    else:
-        return 1024, 1024  # Default fallback
+def infer(args, pipe, prompt_loader, generator=None, loops=5):
+    height, width = parse_resolution(args.resolution)
 
-# Generate image function
-def generate_image(pipe, model_type, prompt, resolution, seed):
-    # Get current model configuration
-    config = MODEL_CONFIGS[model_type]
-    guidance_scale = config["guidance_scale"]
-    num_inference_steps = config["num_inference_steps"]
-    
-    # Parse resolution
-    height, width = parse_resolution(resolution)
-    
-    # Handle random seed
-    if seed == -1:
-        seed = torch.randint(0, 1000000, (1,)).item()
-    
-    # All available GPUs should already be used by the model, no need to manually specify generator's device
-    generator = torch.Generator().manual_seed(seed)
-    
-    # Execute inference
-    with torch.inference_mode():
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    for _, input_info in enumerate(prompt_loader):
+        prompts = input_info['prompts']
+        save_names = input_info['save_names']
+        n_prompts = input_info['n_prompts']
+        break
+
+    use_time = 0
+    for i in range(loops):
+        start_time = time.time()
         images = pipe(
-            prompt,
+            prompts,
             height=height,
             width=width,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            num_images_per_prompt=1,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
             generator=generator
         ).images
-    
-    return images[0], seed
+        # do not count the time spent inferring the first 0 to 1 batches
+        if i > 1:
+            use_time += time.time() - start_time
+            logger.info("current_time is %.3f" % (time.time() - start_time))
+
+        for j in range(n_prompts):
+            image_save_path = os.path.join(args.save_dir, f"{save_names[j]}.png")
+            image = images[j]
+            image.save(image_save_path)
+
+    logger.info("use_time is %.3f" % (use_time / (loops - 2)))
+
+def infer_profiling(args, pipe, prompt_loader, generator=None):
+    height, width = parse_resolution(args.resolution)
+
+    for _, input_info in enumerate(prompt_loader):
+        prompts = input_info['prompts']
+        break
+
+    loops=5
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=torch_npu.profiler.ExportType.Text,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+        data_simplification=False
+    )
+    with torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+        with_stack=True,
+        record_shapes=True,
+        profile_memory=True,
+        schedule=torch_npu.profiler.schedule(wait=2, warmup=2, active=1, repeat=1),
+        experimental_config=experimental_config,
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(args.save_dir_prof)
+    ) as prof:
+        for _ in range(loops):
+            _ = pipe(
+                prompts,
+                height=height,
+                width=width,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                generator=generator
+            ).images
+            prof.step()
+
+def infer_accuracy(args, pipe, prompt_loader, generator=None):
+    height, width = parse_resolution(args.resolution)
+
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    infer_num = 0
+    image_info = []
+    current_prompt = None
+    for _, input_info in enumerate(prompt_loader):
+        prompts = input_info['prompts']
+        catagories = input_info['catagories']
+        save_names = input_info['save_names']
+        n_prompts = input_info['n_prompts']
+
+        infer_num += n_prompts
+        logger.info(f"[{infer_num}/{len(prompt_loader)}]: {prompts}")
+
+        images = pipe(
+            prompts,
+            height=height,
+            width=width,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            generator=generator
+        ).images
+        
+        for j in range(n_prompts):
+            image_save_path = os.path.join(args.save_dir, f"{save_names[j]}.png")
+            image = images[j]
+            image.save(image_save_path)
+
+            if current_prompt != prompts[j]:
+                current_prompt = prompts[j]
+                image_info.append({'images': [], 'prompt': current_prompt, 'category': catagories[j]})
+
+            image_info[-1]['images'].append(image_save_path)
+
+    # Save image information to a json file
+    if os.path.exists(args.info_file_save_path):
+        os.remove(args.info_file_save_path)
+
+    with os.fdopen(os.open(args.info_file_save_path, os.O_RDWR | os.O_CREAT, 0o640), "w") as f:
+        json.dump(image_info, f)
+
 
 if __name__ == "__main__":
-    # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-    # os.environ['NCCL_P2P_DISABLE'] = '1' # for old NVIDIA driver
-    # os.environ['NCCL_IB_DISABLE'] = '1' # for old NVIDIA driver
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="dev")
-    args = parser.parse_args()
-    model_type = args.model_type
-
-    # Initialize default model
-    pipe, _ = load_models(model_type)
-    print("Model loaded successfully!")
-
-    prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"."
-    resolution = "1024 × 1024 (Square)"
-    seed = -1
-    print(f"Generating image, prompt: '{prompt}'")
-    image, used_seed = generate_image(pipe, model_type, prompt, resolution, seed)
-    print(f"Image generation completed! Seed used: {used_seed}")
-    output_path = "output.png"
-    image.save(output_path)
-    print(f"Image saved to: {output_path}")
+    args = parse_arguments()
+    pipe, generator = load_pipe(args)
+    prompt_loader = PromptLoader(
+        args.prompt_file,
+        args.prompt_file_type,
+        args.batch_size,
+        args.num_images_per_prompt,
+        args.max_num_prompts
+    )
+    if args.infer_type == "Default":
+        infer(args, pipe, prompt_loader, generator)
+    elif args.infer_type == "Profiling":
+        infer_profiling(args, pipe, prompt_loader, generator)
+    elif args.infer_type == "Accuracy":
+        infer_accuracy(args, pipe, prompt_loader, generator)
+    else:
+        raise ValueError(f"Not support infer type {args.infer_type}.")

@@ -3,6 +3,7 @@ from torch import nn
 from typing import Optional
 from diffusers.models.attention_processor import Attention
 from diffusers.utils.torch_utils import maybe_allow_in_graph
+from mindiesd import RMSNorm
 
 @maybe_allow_in_graph
 class HiDreamAttention(Attention):
@@ -39,16 +40,16 @@ class HiDreamAttention(Attention):
         self.to_k = linear_cls(self.inner_dim, self.inner_dim)
         self.to_v = linear_cls(self.inner_dim, self.inner_dim)
         self.to_out = linear_cls(self.inner_dim, self.out_dim)
-        self.q_rms_norm = nn.RMSNorm(self.inner_dim, eps)
-        self.k_rms_norm = nn.RMSNorm(self.inner_dim, eps)
+        self.q_rms_norm = RMSNorm(self.inner_dim, eps)
+        self.k_rms_norm = RMSNorm(self.inner_dim, eps)
 
         if not single:
             self.to_q_t = linear_cls(query_dim, self.inner_dim)
             self.to_k_t = linear_cls(self.inner_dim, self.inner_dim)
             self.to_v_t = linear_cls(self.inner_dim, self.inner_dim)
             self.to_out_t = linear_cls(self.inner_dim, self.out_dim)
-            self.q_rms_norm_t = nn.RMSNorm(self.inner_dim, eps)
-            self.k_rms_norm_t = nn.RMSNorm(self.inner_dim, eps)
+            self.q_rms_norm_t = RMSNorm(self.inner_dim, eps)
+            self.k_rms_norm_t = RMSNorm(self.inner_dim, eps)
 
         self.set_processor(processor)
         self.apply(self._init_weights)

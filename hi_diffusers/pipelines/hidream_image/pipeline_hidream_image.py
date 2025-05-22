@@ -612,25 +612,32 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             latents,
         )
 
+        B, _, H, W = latents.shape
+        pH, pW = H // self.transformer.config.patch_size, W // self.transformer.config.patch_size
+        img_sizes = torch.tensor([pH, pW], device=latents.device).reshape(-1)
+        img_sizes = img_sizes.unsqueeze(0)
+
+        img_ids = torch.zeros(pH, pW, 3, device=latents.device)
+        img_ids[..., 1] = img_ids[..., 1] + torch.arange(pH, device=latents.device)[:, None]
+        img_ids[..., 2] = img_ids[..., 2] + torch.arange(pW, device=latents.device)[None, :]
+        img_ids = img_ids.reshape(pH * pW, -1)
         if latents.shape[-2] != latents.shape[-1]:
-            B, C, H, W = latents.shape
-            pH, pW = H // self.transformer.config.patch_size, W // self.transformer.config.patch_size
-
-            img_sizes = torch.tensor([pH, pW], dtype=torch.int64).reshape(-1)
-            img_ids = torch.zeros(pH, pW, 3)
-            img_ids[..., 1] = img_ids[..., 1] + torch.arange(pH)[:, None]
-            img_ids[..., 2] = img_ids[..., 2] + torch.arange(pW)[None, :]
-            img_ids = img_ids.reshape(pH * pW, -1)
-            img_ids_pad = torch.zeros(self.transformer.max_seq, 3)
+            img_ids_pad = torch.zeros(self.transformer.max_seq, 3, device=latents.device)
             img_ids_pad[:pH*pW, :] = img_ids
+            img_ids = img_ids_pad
 
-            img_sizes = img_sizes.unsqueeze(0).to(latents.device) 
-            img_ids = img_ids_pad.unsqueeze(0).to(latents.device) 
-            if self.do_classifier_free_guidance:
-                img_sizes = img_sizes.repeat(2 * B, 1)
-                img_ids = img_ids.repeat(2 * B, 1, 1)
+        if self.do_classifier_free_guidance:
+            img_sizes = img_sizes.repeat(2 * B, 1)
         else:
-            img_sizes = img_ids = None
+            img_sizes = img_sizes.repeat(B, 1)
+
+        txt_ids = torch.zeros(
+            prompt_embeds[0].shape[1] + prompt_embeds[1][-1].shape[1] + prompt_embeds[1][0].shape[1], 
+            3, 
+            device=img_ids.device, dtype=img_ids.dtype
+        )
+        ids = torch.cat((img_ids, txt_ids), dim=0)
+        rope = self.transformer.pe_embedder(ids)
 
         # 5. Prepare timesteps
         mu = calculate_shift(self.transformer.max_seq)
@@ -660,26 +667,13 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
-                if latent_model_input.shape[-2] != latent_model_input.shape[-1]:
-                    B, C, H, W = latent_model_input.shape
-                    patch_size = self.transformer.config.patch_size
-                    pH, pW = H // patch_size, W // patch_size
-                    out = torch.zeros(
-                        (B, C, self.transformer.max_seq, patch_size * patch_size), 
-                        dtype=latent_model_input.dtype, 
-                        device=latent_model_input.device
-                    )
-                    latent_model_input = einops.rearrange(latent_model_input, 'B C (H p1) (W p2) -> B C (H W) (p1 p2)', p1=patch_size, p2=patch_size)
-                    out[:, :, 0:pH*pW] = latent_model_input
-                    latent_model_input = out
-
                 noise_pred = self.transformer(
                     hidden_states = latent_model_input,
                     timesteps = timestep,
                     encoder_hidden_states = prompt_embeds,
                     pooled_embeds = pooled_prompt_embeds,
                     img_sizes = img_sizes,
-                    img_ids = img_ids,
+                    rope = rope,
                     return_dict = False,
                 )[0]
                 noise_pred = -noise_pred

@@ -3,23 +3,19 @@ from torch import nn
 from typing import List
 from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
-# Copied from https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
     assert dim % 2 == 0, "The dimension must be even."
 
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
-
-    batch_size, seq_length = pos.shape
     out = torch.einsum("...n,d->...nd", pos, omega)
-    cos_out = torch.cos(out)
-    sin_out = torch.sin(out)
+    cos_out = torch.cos(out).repeat_interleave(2, dim=-1).unsqueeze(1).unsqueeze(0)
+    sin_out = torch.sin(out).repeat_interleave(2, dim=-1).unsqueeze(1).unsqueeze(0)
 
-    stacked_out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
-    out = stacked_out.view(batch_size, -1, dim // 2, 2, 2)
-    return out.float()
+    # (2, 1, seq, 1, dim)
+    stacked_out = torch.stack([cos_out, sin_out], dim=0)
+    return stacked_out
 
-# Copied from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
 class EmbedND(nn.Module):
     def __init__(self, theta: int, axes_dim: List[int]):
         super().__init__()
@@ -30,10 +26,10 @@ class EmbedND(nn.Module):
         n_axes = ids.shape[-1]
         emb = torch.cat(
             [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
+            dim=-1,
         )
-        return emb.unsqueeze(2)
-    
+        return emb
+
 class PatchEmbed(nn.Module):
     def __init__(
         self,

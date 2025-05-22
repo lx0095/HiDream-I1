@@ -16,15 +16,6 @@ from diffusers.utils import deprecate, is_scipy_available
 if is_scipy_available():
     import scipy.stats
 
-def svd_lstsq(AA, BB, tol=1e-5):
-    U, S, Vh = torch.linalg.svd(AA, full_matrices=False)
-    Spinv = torch.zeros_like(S)
-    Spinv[S>tol] = 1/S[S>tol]
-    UhBB = U.adjoint() @ BB
-    if Spinv.ndim!=UhBB.ndim:
-      Spinv = Spinv.unsqueeze(-1)
-    SpinvUhBB = Spinv * UhBB
-    return Vh.adjoint() @ SpinvUhBB
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
     """
@@ -356,6 +347,58 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
             return epsilon
 
+    def lu_with_partial_pivoting(self, A):
+        """
+        带部分主元选取的 LU 分解实现
+        A: 输入矩阵 (n x n)
+        返回: (P, L, U) 元组，其中 P 是排列矩阵
+        """
+        n = A.size(0)
+        P = torch.eye(n, dtype=A.dtype, device=A.device)
+        L = torch.eye(n, dtype=A.dtype, device=A.device)
+        U = A.clone()
+        
+        for k in range(n-1):
+            # 部分主元选取: 找到第k列中绝对值最大的元素
+            pivot_row = torch.argmax(torch.abs(U[k:, k])) + k
+            
+            # 交换行
+            if pivot_row != k:
+                U[[k, pivot_row], :] = U[[pivot_row, k], :]
+                P[[k, pivot_row], :] = P[[pivot_row, k], :]
+                if k > 0:
+                    L[[k, pivot_row], :k] = L[[pivot_row, k], :k]
+            
+            # 高斯消去
+            for i in range(k+1, n):
+                L[i, k] = U[i, k] / U[k, k]
+                U[i, k:] = U[i, k:] - L[i, k] * U[k, k:]
+        
+        return P, L, U
+    
+    def solve_with_custom_lu(self, A, B):
+        """
+        使用自定义 LU 分解求解 AX = B
+        """
+        # 执行 LU 分解
+        P, L, U = self.lu_with_partial_pivoting(A)
+        B = B.reshape(-1, 1)
+        
+        # 解 LY = PB (前向替换)
+        PB = torch.matmul(P, B)
+        Y = torch.zeros_like(B)
+        n = L.size(0)
+        
+        for i in range(n):
+            Y[i] = PB[i] - torch.sum(L[i, :i].unsqueeze(1) * Y[:i], dim=0)
+        
+        # 解 UX = Y (后向替换)
+        X = torch.zeros_like(B)
+        for i in range(n-1, -1, -1):
+            X[i] = (Y[i] - torch.sum(U[i, i+1:].unsqueeze(1) * X[i+1:], dim=0)) / U[i, i]
+        
+        return X.reshape(-1)
+
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -467,9 +510,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             if order == 2:
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
-                # rhos_p = torch.linalg.solve(R[:-1, :-1],
-                #                             b[:-1]).to(device).to(x.dtype)
-                rhos_p = svd_lstsq(R[:-1, :-1],
+                rhos_p = self.solve_with_custom_lu(R[:-1, :-1],
                                             b[:-1]).to(device).to(x.dtype)
         else:
             D1s = None
@@ -615,8 +656,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            # rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
-            rhos_c = svd_lstsq(R, b).to(device).to(x.dtype)
+            rhos_c = self.solve_with_custom_lu(R, b).to(device).to(x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
